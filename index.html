@@ -1,0 +1,1522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Rounds — a loan chart for health-professional students</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { margin: 0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+
+/* ---------------------------------------------------------------
+   Calculation engine
+--------------------------------------------------------------- */
+
+function rapMonthly(priorYearIncome) {
+  if (priorYearIncome <= 10000) return 10;
+  const bands = [
+    [20000, 0.01], [30000, 0.02], [40000, 0.03], [50000, 0.04],
+    [60000, 0.05], [70000, 0.06], [80000, 0.07], [90000, 0.08], [100000, 0.09],
+  ];
+  for (const [ceiling, pct] of bands) {
+    if (priorYearIncome <= ceiling) return (priorYearIncome * pct) / 12;
+  }
+  return (priorYearIncome * 0.10) / 12;
+}
+
+function pmt(monthlyRate, n, pv) {
+  if (pv <= 0) return 0;
+  if (monthlyRate === 0) return pv / n;
+  return (pv * monthlyRate) / (1 - Math.pow(1 + monthlyRate, -n));
+}
+
+// Builds the year-by-year federal RAP timeline. RAP payments are based on
+// the PRIOR year's AGI (year 0 = $0, since a student has no reportable
+// income the year before starting training) — so PGY1 is always the $10
+// minimum regardless of PGY1 salary.
+function buildTimeline(fedGrad, fedAvgRate, incomes, forcePSLF, horizon, year1PriorIncome) {
+  const timeline = [];
+  let bal = fedGrad;
+  let forgivenAmount = null;
+  for (let year = 1; year <= horizon; year++) {
+    const prevIncome = year === 1 ? year1PriorIncome : incomes[year - 2];
+    const forgivenAlready = forcePSLF && year > 10;
+    const interest = forgivenAlready ? 0 : bal * fedAvgRate;
+    const payment = forgivenAlready ? 0 : rapMonthly(prevIncome) * 12;
+    const rawEnding = Math.max(0, bal - Math.max(0, payment - interest));
+    const isForgiveYear = forcePSLF && year === 10;
+    const ending = forcePSLF && year >= 10 ? 0 : rawEnding;
+    if (isForgiveYear) forgivenAmount = rawEnding;
+    timeline.push({ year, prevIncome, beginning: bal, interest, payment, ending });
+    bal = ending;
+  }
+  return { timeline, forgivenAmount };
+}
+
+// Simulates month-by-month amortization with a level monthly payment, plus
+// optional equal lump-sum payments (e.g. an employer loan repayment benefit)
+// hitting at the end of specified years. Returns months-to-payoff and totals.
+function simulatePayoff(balance, monthlyRate, monthlyPayment, lumpSumPerYear, lumpYears, maxMonths = 600) {
+  let bal = balance, totalPaid = 0, months = 0;
+  const snapshots = []; // one entry per completed year: { year, endingBalance }
+  for (let m = 1; m <= maxMonths; m++) {
+    if (bal <= 0) break;
+    const interest = bal * monthlyRate;
+    const scheduled = Math.min(monthlyPayment, bal + interest);
+    bal = bal + interest - scheduled;
+    totalPaid += scheduled;
+    if (m % 12 === 0) {
+      const yearIndex = m / 12;
+      if (lumpSumPerYear > 0 && yearIndex <= lumpYears && bal > 0) {
+        const applied = Math.min(lumpSumPerYear, bal);
+        bal -= applied;
+        totalPaid += applied;
+      }
+      snapshots.push({ year: yearIndex, endingBalance: Math.max(0, bal) });
+    }
+    months = m;
+    if (bal <= 0.5) { bal = 0; break; }
+  }
+  // fill remaining requested years with $0 once paid off early
+  const totalYears = Math.floor(maxMonths / 12);
+  for (let y = snapshots.length + 1; y <= totalYears; y++) snapshots.push({ year: y, endingBalance: 0 });
+  return { months, totalPaid, endingBalance: Math.max(0, bal), snapshots };
+}
+
+// Same amortization as simulatePayoff, but returns one row per year with
+// beginning balance, interest actually paid that year, payment shown, and
+// ending balance — used where a reader wants to see interest broken out
+// (rather than just the aggregate totals simulatePayoff returns).
+function simulatePayoffAnnualDetail(balance, monthlyRate, monthlyPayment, lumpSumPerYear, lumpYears, years) {
+  let bal = balance, totalPaid = 0, months = 0, paidOffMonth = null;
+  const rows = [];
+  for (let yr = 1; yr <= years; yr++) {
+    const beginningBalance = bal;
+    let interestPaid = 0;
+    for (let mm = 1; mm <= 12; mm++) {
+      months++;
+      if (bal <= 0) break;
+      const interest = bal * monthlyRate;
+      interestPaid += interest;
+      const scheduled = Math.min(monthlyPayment, bal + interest);
+      bal = bal + interest - scheduled;
+      totalPaid += scheduled;
+      if (bal <= 0.5) { bal = 0; if (paidOffMonth === null) paidOffMonth = months; }
+    }
+    if (lumpSumPerYear > 0 && yr <= lumpYears && bal > 0) {
+      const applied = Math.min(lumpSumPerYear, bal);
+      bal -= applied;
+      totalPaid += applied;
+      if (bal <= 0.5) { bal = 0; if (paidOffMonth === null) paidOffMonth = months; }
+    }
+    rows.push({
+      year: yr,
+      beginningBalance,
+      interestPaid,
+      monthlyPayment: beginningBalance > 0 ? monthlyPayment : 0,
+      endingBalance: Math.max(0, bal),
+    });
+  }
+  return { rows, totalPaid, endingBalance: Math.max(0, bal), monthsToPayoff: paidOffMonth ?? years * 12 };
+}
+
+// A simple approximation of effective tax rate (federal + FICA + a typical
+// state average, blended) by gross annual income — not a real bracket
+// calculator, just enough to keep "money left over" honest.
+function effectiveTaxRate(grossAnnualIncome) {
+  if (grossAnnualIncome <= 0) return 0;
+  const bands = [
+    [20000, 0.10], [40000, 0.14], [60000, 0.18], [90000, 0.22],
+    [130000, 0.26], [200000, 0.30], [300000, 0.33], [450000, 0.35],
+  ];
+  for (const [ceiling, rate] of bands) {
+    if (grossAnnualIncome <= ceiling) return rate;
+  }
+  return 0.37;
+}
+function netAnnual(grossAnnualIncome) {
+  return grossAnnualIncome * (1 - effectiveTaxRate(grossAnnualIncome));
+}
+
+function computeModel(a) {
+  const { yearsInSchool, trainingYears, pslf, refiRate, attendingSalary, privTrainPmt } = a;
+  const { salaryGrowthEnabled, salaryGrowthPct, salaryCap, employerBenefitTotal, employerBenefitYears } = a;
+  const { liveLikeResidentMode, liveLikeResidentYears } = a; // mode: 'off' | 'strict' | 'kinda'
+  const { lastYearSchoolIncomeZero, lastYearSchoolIncome } = a;
+  const { privRefiMode, privRefiRate } = a;
+  const year1PriorIncome = lastYearSchoolIncomeZero ? 0 : lastYearSchoolIncome || 0;
+
+  // ---- resolve borrowing rows (simple totals spread evenly, or exact) ----
+  let rows;
+  if (a.borrowMode === "simple") {
+    const perYearFed = a.simpleBorrow.fedTotal / yearsInSchool;
+    const perYearPriv = a.simpleBorrow.privTotal / yearsInSchool;
+    rows = Array.from({ length: yearsInSchool }, () => ({
+      fedAmt: perYearFed, fedRate: a.simpleBorrow.fedRate,
+      privAmt: perYearPriv, privRate: a.simpleBorrow.privRate,
+    }));
+  } else {
+    rows = a.detailedRows.slice(0, yearsInSchool);
+  }
+
+  // ---- resolve PGY salaries ----
+  let pgySalaries;
+  if (a.salaryMode === "average") {
+    pgySalaries = Array.from({ length: trainingYears }, () => a.avgPgySalary);
+  } else {
+    pgySalaries = a.detailedPgySalaries.slice(0, trainingYears);
+  }
+
+  // ---- debt at graduation ----
+  let fedGrad = 0, privGrad = 0, fedWeighted = 0, privWeighted = 0, fedAmtSum = 0, privAmtSum = 0;
+  for (let y = 1; y <= yearsInSchool; y++) {
+    const row = rows[y - 1] || { fedAmt: 0, fedRate: 0, privAmt: 0, privRate: 0 };
+    const exp = yearsInSchool - y + 1.5;
+    fedGrad += row.fedAmt * Math.pow(1 + row.fedRate, exp);
+    privGrad += row.privAmt * Math.pow(1 + row.privRate, exp);
+    fedWeighted += row.fedAmt * row.fedRate;
+    privWeighted += row.privAmt * row.privRate;
+    fedAmtSum += row.fedAmt;
+    privAmtSum += row.privAmt;
+  }
+  const fedAvgRate = fedAmtSum > 0 ? fedWeighted / fedAmtSum : 0;
+  const privAvgRate = privAmtSum > 0 ? privWeighted / privAmtSum : 0;
+
+  // ---- income series across all post-grad years (for prior-year AGI lookups) ----
+  const HORIZON = Math.max(15, trainingYears + 15);
+  const incomes = Array.from({ length: HORIZON }, (_, i) => {
+    const year = i + 1;
+    if (year <= trainingYears) return pgySalaries[year - 1] ?? attendingSalary;
+    const attendingYearIndex = year - trainingYears - 1; // 0-based
+    if (!salaryGrowthEnabled) return attendingSalary;
+    return Math.min(salaryCap, attendingSalary * Math.pow(1 + salaryGrowthPct, attendingYearIndex));
+  });
+
+  // actual timeline, respecting the user's real PSLF choice
+  const { timeline } = buildTimeline(fedGrad, fedAvgRate, incomes, pslf, HORIZON, year1PriorIncome);
+
+  // a parallel "stays on RAP all the way to PSLF" scenario, shown regardless
+  // of the user's choice, since realistically anyone staying on RAP long
+  // term is functionally pursuing PSLF
+  const { timeline: pslfTimeline, forgivenAmount: pslfForgiven } = buildTimeline(fedGrad, fedAvgRate, incomes, true, 10, year1PriorIncome);
+  const pslfTotalPaid = pslfTimeline.reduce((s, r) => s + r.payment, 0);
+
+  // ---- private loan training accrual (no subsidy) ----
+  const privTimeline = [];
+  let pbal = privGrad;
+  for (let year = 1; year <= trainingYears; year++) {
+    const interest = pbal * privAvgRate;
+    const payment = privTrainPmt * 12;
+    const ending = Math.max(0, pbal + interest - payment);
+    privTimeline.push({ year, beginning: pbal, interest, payment, ending });
+    pbal = ending;
+  }
+
+  const fedAttendBalance = trainingYears === 0 ? fedGrad : (timeline[trainingYears - 1]?.ending ?? fedGrad);
+  const privAttendBalance = trainingYears === 0 ? privGrad : (privTimeline[trainingYears - 1]?.ending ?? privGrad);
+  const fedRateUsed = pslf ? fedAvgRate : refiRate;
+  // If not pursuing PSLF, federal (refinanced) and private balances get
+  // combined into one new loan at the start of attending life — that's how
+  // refinancing actually works when consolidating federal + existing private
+  // debt. If pursuing PSLF, federal stays on RAP (untouched) and private
+  // remains its own separate loan.
+  const refiFixedBalance = pslf ? fedAttendBalance : fedAttendBalance + privAttendBalance;
+
+  const terms = [5, 10, 15];
+  const employerLumpPerYear = employerBenefitTotal > 0 ? employerBenefitTotal / employerBenefitYears : 0;
+  const fedFixed = terms.map((term) => {
+    const mp = pmt(fedRateUsed / 12, term * 12, refiFixedBalance);
+    const sim = simulatePayoff(refiFixedBalance, fedRateUsed / 12, mp, employerLumpPerYear, employerBenefitYears);
+    return {
+      term, monthly: mp,
+      totalPaid: sim.totalPaid,
+      totalInterest: sim.totalPaid - refiFixedBalance,
+      payoffMonths: sim.months,
+      sped_up: sim.months < term * 12,
+    };
+  });
+  // private loans aren't PSLF-eligible regardless of the federal path, but
+  // many residents refinance them separately once they have attending income
+  // and better credit — that only changes the RATE used from here on, not
+  // the principal (privAttendBalance is unaffected)
+  const privRateForRepayment = privRefiMode === "refinance" ? privRefiRate : privAvgRate;
+  const privFixed = terms.map((term) => {
+    const mp = pmt(privRateForRepayment / 12, term * 12, privAttendBalance);
+    return { term, monthly: mp, totalPaid: mp * term * 12, totalInterest: mp * term * 12 - privAttendBalance, payoffMonths: term * 12, sped_up: false };
+  });
+
+  // ---- residency life: monthly salary vs. monthly RAP payment per PGY year ----
+  const residencyLife = Array.from({ length: trainingYears }, (_, i) => ({
+    year: i + 1,
+    grossAnnual: incomes[i],
+    monthlySalary: netAnnual(incomes[i]) / 12,
+    monthlyPayment: timeline[i].payment / 12,
+    privatePayment: privTimeline[i] ? privTimeline[i].payment / 12 : 0,
+  }));
+
+  // ---- attending life: monthly take-home salary + gross annual for the first 15 attending years ----
+  const attendingMonthlySalaries = Array.from({ length: 15 }, (_, i) => ({
+    grossAnnual: incomes[trainingYears + i],
+    monthlyNet: netAnnual(incomes[trainingYears + i]) / 12,
+  }));
+  // if pursuing PSLF, federal loans stay on RAP minimum payments the whole
+  // way (forgiven at year 10 total) — the 5/10/15 term toggle never applies
+  // to federal in that case, only to private
+  const attendingRAPPayments = Array.from({ length: 15 }, (_, i) => (timeline[trainingYears + i]?.payment ?? 0) / 12);
+
+  // ---- "live like a resident" scenarios: keep living on the take-home pay a
+  // resident-level income would provide, send the rest of attending take-home
+  // pay to loans. If pursuing PSLF, federal loans are being forgiven anyway,
+  // so the extra money is redirected to private loans instead — prepaying a
+  // loan that's about to be forgiven doesn't help. Computed for both the 1x
+  // and 2x living basis, and for 1, 2, and 3 years, so the results page can
+  // toggle between all of them without re-running the wizard. ----
+  const lastResidencySalary = trainingYears > 0 ? pgySalaries[trainingYears - 1] : null;
+  const llrTargetsFederal = !pslf;
+  const llrTargetBalance = llrTargetsFederal ? refiFixedBalance : privAttendBalance;
+  const llrTargetRate = llrTargetsFederal ? fedRateUsed : privRateForRepayment;
+  const llrActive = liveLikeResidentMode !== "off" && lastResidencySalary != null && llrTargetBalance > 0;
+
+  let llrScenarios = null; // { strict: { 1: {...}, 2: {...}, 3: {...} }, kinda: { ... } }
+  if (llrActive) {
+    llrScenarios = {};
+    const llrLumpPerYear = llrTargetsFederal ? employerLumpPerYear : 0;
+    const llrLumpYears = llrTargetsFederal ? employerBenefitYears : 0;
+    for (const [modeKey, multiplier] of [["strict", 1], ["kinda", 2]]) {
+      const livingOnGross = multiplier * lastResidencySalary;
+      const monthlyPayment = Math.max(0, netAnnual(attendingSalary) - netAnnual(livingOnGross)) / 12;
+      if (monthlyPayment <= 0) continue;
+      llrScenarios[modeKey] = {};
+      for (const y of [1, 2, 3]) {
+        const detail = simulatePayoffAnnualDetail(llrTargetBalance, llrTargetRate / 12, monthlyPayment, llrLumpPerYear, llrLumpYears, y);
+        const rows = detail.rows;
+        // continuation phase: whatever's left, under a chosen 5/10/15-year plan
+        const remainingBenefitYears = Math.max(0, llrLumpYears - y);
+        const continuationFixed =
+          detail.endingBalance > 0
+            ? terms.map((term) => {
+                const mp = pmt(llrTargetRate / 12, term * 12, detail.endingBalance);
+                const contSim = simulatePayoff(detail.endingBalance, llrTargetRate / 12, mp, llrLumpPerYear, remainingBenefitYears);
+                return {
+                  term, monthly: mp, totalPaid: contSim.totalPaid,
+                  totalInterest: contSim.totalPaid - detail.endingBalance,
+                  payoffMonths: contSim.months, sped_up: contSim.months < term * 12,
+                };
+              })
+            : null;
+        llrScenarios[modeKey][y] = {
+          years: y,
+          monthlyPayment,
+          livingOn: livingOnGross,
+          rows,
+          paidOff: detail.endingBalance === 0,
+          monthsToPayoff: detail.monthsToPayoff,
+          endingBalance: detail.endingBalance,
+          totalPaid: detail.totalPaid,
+          continuationFixed,
+        };
+      }
+    }
+  }
+
+  return {
+    fedGrad, privGrad, fedAvgRate, privAvgRate,
+    fedAttendBalance, privAttendBalance, refiFixedBalance, fedFixed, privFixed,
+    totalBorrowedFed: fedAmtSum, totalBorrowedPriv: privAmtSum,
+    pslfTotalPaid, pslfForgiven,
+    lastResidencySalary, privTimeline, attendingRAPPayments, llrTargetsFederal, privRateForRepayment,
+    residencyLife, attendingMonthlySalaries, llrScenarios, defaultLLRYears: liveLikeResidentYears,
+  };
+}
+
+/* ---------------------------------------------------------------
+   Formatting helpers
+--------------------------------------------------------------- */
+const money = (n) => {
+  if (n === null || n === undefined || isNaN(n)) return "$0";
+  const rounded = Math.round(n);
+  return (rounded < 0 ? "-$" : "$") + Math.abs(rounded).toLocaleString("en-US");
+};
+const pct = (n) => `${(n * 100).toFixed(2)}%`;
+
+/* ---------------------------------------------------------------
+   Mini bar chart (used for the residency-life panel)
+--------------------------------------------------------------- */
+function DualLineChart({ data, xKey, series, format }) {
+  const w = 620, h = 200, pad = 30;
+  const n = data.length;
+  const stepX = (w - pad * 2) / (n - 1);
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+      {series.map((s) => {
+        const max = Math.max(...data.map((d) => d[s.key]), 1);
+        const points = data.map((d, i) => [pad + i * stepX, pad + (1 - d[s.key] / max) * (h - pad * 2 - 16)]);
+        const path = points.map(([x, y], i) => `${i === 0 ? "M" : "L"} ${x} ${y}`).join(" ");
+        return (
+          <g key={s.key}>
+            <path d={path} fill="none" stroke={s.color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            {[0, points.length - 1].map((i) => (
+              <g key={i}>
+                <circle cx={points[i][0]} cy={points[i][1]} r="3" fill={s.color} />
+                <text
+                  x={points[i][0]}
+                  y={points[i][1] - 8}
+                  textAnchor={i === 0 ? "start" : "end"}
+                  fontSize="9"
+                  fill={s.color}
+                  fontFamily="IBM Plex Mono"
+                >
+                  {format(data[i][s.key])}
+                </text>
+              </g>
+            ))}
+          </g>
+        );
+      })}
+      {data.map((d, i) => (
+        <text key={i} x={pad + i * stepX} y={h - 6} textAnchor="middle" fontSize="8.5" fill="#64767E" fontFamily="IBM Plex Sans">
+          {d[xKey]}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+function ChartLegend({ items }) {
+  return (
+    <div className="flex items-center gap-4 mb-2">
+      {items.map((it) => (
+        <div key={it.label} className="flex items-center gap-1.5">
+          <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: it.color }} />
+          <span className="text-xs font-plex text-slate">{it.label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Yearly balance trajectory for charting — same amortization logic as the
+// engine above, sampled once per year rather than returning aggregates.
+function computeYearlyBalances(startBalance, monthlyRate, monthlyPayment, lumpPerYear, lumpYears, maxYears) {
+  const balances = [startBalance];
+  let bal = startBalance;
+  for (let yr = 1; yr <= maxYears; yr++) {
+    for (let m = 1; m <= 12; m++) {
+      if (bal <= 0) break;
+      const interest = bal * monthlyRate;
+      const scheduled = Math.min(monthlyPayment, bal + interest);
+      bal = bal + interest - scheduled;
+    }
+    if (lumpPerYear > 0 && yr <= lumpYears && bal > 0) bal = Math.max(0, bal - lumpPerYear);
+    balances.push(Math.max(0, bal));
+  }
+  return balances;
+}
+
+// Multiple lines sharing one balance axis — for comparing how fast 5/10/15
+// year plans pay down the same starting balance.
+function MultiLineBalanceChart({ series, years }) {
+  const w = 620, h = 200, pad = 34;
+  const maxVal = Math.max(...series.flatMap((s) => s.values), 1);
+  const stepX = (w - pad * 2) / years;
+  const ticks = [0, 5, 10, 15].filter((t) => t <= years);
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+      <line x1={pad} y1={h - pad} x2={w - pad} y2={h - pad} stroke="#16262F" strokeOpacity="0.1" />
+      {series.map((s) => {
+        const points = s.values.map((v, i) => [pad + i * stepX, pad + (1 - v / maxVal) * (h - pad * 2)]);
+        const path = points.map(([x, y], i) => `${i === 0 ? "M" : "L"} ${x} ${y}`).join(" ");
+        return <path key={s.label} d={path} fill="none" stroke={s.color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />;
+      })}
+      {ticks.map((t) => (
+        <text key={t} x={pad + t * stepX} y={h - 8} textAnchor="middle" fontSize="8.5" fill="#64767E" fontFamily="IBM Plex Sans">
+          {t}
+        </text>
+      ))}
+    </svg>
+  );
+}
+
+function YearTable({ data, yearLabel, columns }) {
+  return (
+    <table className="w-full text-sm font-plex">
+      <thead>
+        <tr className="text-left text-slate text-xs">
+          <th className="font-normal pb-2">{yearLabel}</th>
+          {columns.map((c) => (
+            <th key={c.key} className="font-normal pb-2">{c.label}</th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {data.map((d, i) => (
+          <tr key={i} className="border-t border-ink/5">
+            <td className="py-2 text-ink">{d.year}</td>
+            {columns.map((c) => (
+              <td key={c.key} className={`py-2 font-mono ${c.color || "text-ink"}`}>{c.format(d[c.key])}</td>
+            ))}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function MiniBarChart({ data, labelKey, valueKey, color, format }) {
+  const w = 300, h = 120, pad = 20, barGap = 10;
+  const max = Math.max(...data.map((d) => d[valueKey]), 1);
+  const barW = (w - pad * 2 - barGap * (data.length - 1)) / data.length;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-auto">
+      {data.map((d, i) => {
+        const barH = (d[valueKey] / max) * (h - pad * 2);
+        const x = pad + i * (barW + barGap);
+        const y = h - pad - barH;
+        return (
+          <g key={i}>
+            <rect x={x} y={y} width={barW} height={barH} rx="3" fill={color} />
+            <text x={x + barW / 2} y={h - pad + 14} textAnchor="middle" fontSize="9" fill="#64767E" fontFamily="IBM Plex Sans">
+              {d[labelKey]}
+            </text>
+            <text x={x + barW / 2} y={y - 4} textAnchor="middle" fontSize="8.5" fill="#16262F" fontFamily="IBM Plex Mono">
+              {format(d[valueKey])}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/* ---------------------------------------------------------------
+   Shared UI atoms
+--------------------------------------------------------------- */
+function Field({ label, hint, children }) {
+  return (
+    <div className="mb-5">
+      <label className="block font-plex text-sm font-medium text-ink mb-1">{label}</label>
+      {hint && <p className="text-xs text-slate mb-2 font-plex">{hint}</p>}
+      {children}
+    </div>
+  );
+}
+
+function NumberInput({ value, onChange, prefix, suffix, step = 1000, placeholder }) {
+  return (
+    <div className="flex items-center rounded-lg border border-ink/15 bg-white px-3 py-2 focus-within:border-teal focus-within:ring-1 focus-within:ring-teal">
+      {prefix && <span className="text-slate font-mono text-sm mr-1">{prefix}</span>}
+      <input
+        type="number"
+        value={value === 0 ? "" : value}
+        step={step}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value === "" ? 0 : parseFloat(e.target.value) || 0)}
+        className="w-full bg-transparent outline-none font-mono text-ink text-sm placeholder:text-slate/50"
+      />
+      {suffix && <span className="text-slate font-mono text-sm ml-1">{suffix}</span>}
+    </div>
+  );
+}
+
+function ChoiceRow({ options, value, onChange }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map((opt) => (
+        <button
+          key={String(opt.value)}
+          onClick={() => !opt.disabled && onChange(opt.value)}
+          disabled={opt.disabled}
+          className={`px-4 py-2.5 rounded-full border text-sm font-plex transition-colors flex items-center gap-1.5 ${
+            opt.disabled
+              ? "bg-white text-slate/50 border-ink/10 cursor-not-allowed"
+              : value === opt.value
+              ? "bg-teal text-paper border-teal"
+              : "bg-white text-ink border-ink/20 hover:border-ink/50"
+          }`}
+        >
+          {opt.label}
+          {opt.note && (
+            <span className="text-[10px] uppercase tracking-wide bg-ink/10 text-slate rounded-full px-1.5 py-0.5">
+              {opt.note}
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function NavButtons({ onBack, onNext, backDisabled, nextLabel = "Next" }) {
+  return (
+    <div className="flex items-center justify-between mt-8">
+      <button
+        onClick={onBack}
+        disabled={backDisabled}
+        className="flex items-center gap-1.5 text-sm font-plex text-slate disabled:opacity-0 hover:text-ink transition-colors"
+      >
+        ← Back
+      </button>
+      <button
+        onClick={onNext}
+        className="flex items-center gap-2 bg-teal text-paper px-5 py-2.5 rounded-full text-sm font-plex font-medium hover:bg-teal/90 transition-colors"
+      >
+        {nextLabel} →
+      </button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   Main app
+--------------------------------------------------------------- */
+const PROGRAM_DEFAULTS = {
+  "Medical (MD/DO)": { years: 4, training: 4 },
+  "Physician Assistant (PA)": { years: 2, training: 0 },
+  "Pharmacy (PharmD)": { years: 4, training: 0 },
+  "Other / Custom": { years: 4, training: 0 },
+};
+
+const emptyRow = () => ({ fedAmt: 0, fedRate: 0, privAmt: 0, privRate: 0 });
+
+function Rounds() {
+  const [answers, setAnswers] = useState({
+    programType: "Medical (MD/DO)",
+    yearsInSchool: 4,
+    trainingYears: 4,
+    lastYearSchoolIncomeZero: true,
+    lastYearSchoolIncome: 0,
+    pslf: null,
+    refiRate: 0.055,
+    borrowMode: "simple",
+    simpleBorrow: { fedTotal: 0, fedRate: 0, privTotal: 0, privRate: 0 },
+    detailedRows: Array.from({ length: 6 }, emptyRow),
+    salaryMode: "average",
+    avgPgySalary: 0,
+    detailedPgySalaries: Array.from({ length: 7 }, () => 0),
+    attendingSalary: 0,
+    salaryGrowthEnabled: false,
+    salaryGrowthPct: 0.03,
+    salaryCap: 500000,
+    employerBenefitTotal: 0,
+    employerBenefitYears: 3,
+    liveLikeResidentMode: "off", // 'off' | 'strict' | 'kinda'
+    liveLikeResidentYears: 3,
+    privTrainPmt: 0,
+    privRefiMode: "keep", // 'keep' | 'refinance'
+    privRefiRate: 0.065,
+  });
+  const [stepIndex, setStepIndex] = useState(0);
+
+  const set = (patch) => setAnswers((a) => ({ ...a, ...patch }));
+  const setRow = (i, patch) =>
+    setAnswers((a) => {
+      const rows = [...a.detailedRows];
+      rows[i] = { ...rows[i], ...patch };
+      return { ...a, detailedRows: rows };
+    });
+  const setSalary = (i, val) =>
+    setAnswers((a) => {
+      const s = [...a.detailedPgySalaries];
+      s[i] = val;
+      return { ...a, detailedPgySalaries: s };
+    });
+
+  const totalPrivateBorrowed =
+    answers.borrowMode === "simple"
+      ? answers.simpleBorrow.privTotal
+      : answers.detailedRows.slice(0, answers.yearsInSchool).reduce((s, r) => s + r.privAmt, 0);
+
+  const steps = useMemo(() => {
+    const list = [
+      { type: "program" },
+      { type: "yearsInSchool" },
+      { type: "trainingYears" },
+      { type: "pslf" },
+    ];
+    if (answers.pslf === false) list.push({ type: "refiRate" });
+    list.push({ type: "borrowIntro" });
+    if (answers.borrowMode === "detailed") {
+      for (let i = 0; i < (answers.yearsInSchool || 0); i++) list.push({ type: "borrowYear", index: i });
+    }
+    if ((answers.trainingYears || 0) > 0) list.push({ type: "lastYearIncome" });
+    if ((answers.trainingYears || 0) > 0) list.push({ type: "pgySalary" });
+    list.push({ type: "attendingSalary" });
+    if ((answers.trainingYears || 0) > 0) list.push({ type: "liveLikeResident" });
+    if ((answers.trainingYears || 0) > 0 && totalPrivateBorrowed > 0) list.push({ type: "privTrainPmt" });
+    if (answers.pslf === true && totalPrivateBorrowed > 0) list.push({ type: "privRefi" });
+    list.push({ type: "results" });
+    return list;
+  }, [answers.pslf, answers.yearsInSchool, answers.trainingYears, answers.borrowMode, totalPrivateBorrowed]);
+
+  const clampedIndex = Math.min(stepIndex, steps.length - 1);
+  const step = steps[clampedIndex];
+  const isResults = step.type === "results";
+
+  const model = useMemo(() => (isResults ? computeModel(answers) : null), [isResults, answers]);
+
+  const goNext = () => setStepIndex((i) => Math.min(i + 1, steps.length - 1));
+  const goBack = () => setStepIndex((i) => Math.max(i - 1, 0));
+
+  const progressPct = Math.round((clampedIndex / (steps.length - 1)) * 100);
+
+  return (
+    <div className="min-h-screen bg-paper font-plex">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+        .bg-paper { background-color: #EEF3F1; }
+        .bg-ink { background-color: #16262F; }
+        .bg-teal-tint { background-color: #E1EDEA; }
+        .border-teal-tint { border-color: #BFDCD3; }
+        .text-ink { color: #16262F; }
+        .text-slate { color: #64767E; }
+        .text-teal { color: #2F6F62; }
+        .text-amber { color: #C98A3B; }
+        .text-coral { color: #B5493D; }
+        .bg-teal { background-color: #2F6F62; }
+        .bg-amber { background-color: #C98A3B; }
+        .bg-coral { background-color: #B5493D; }
+        .border-teal { border-color: #2F6F62; }
+        .font-serif { font-family: 'Source Serif 4', serif; }
+        .font-plex { font-family: 'IBM Plex Sans', sans-serif; }
+        .font-mono { font-family: 'IBM Plex Mono', monospace; }
+        @media (prefers-reduced-motion: reduce) {
+          * { transition: none !important; animation: none !important; }
+        }
+      `}</style>
+
+      <div className="max-w-2xl mx-auto px-6 pt-8">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="font-serif text-lg text-ink tracking-tight">Rounds</span>
+          <span className="font-plex text-xs text-slate ml-1">a loan chart for health-professional students</span>
+        </div>
+        {!isResults && (
+          <div className="h-1 bg-ink/10 rounded-full mt-4 overflow-hidden">
+            <div className="h-full bg-teal transition-all duration-300" style={{ width: `${progressPct}%` }} />
+          </div>
+        )}
+      </div>
+
+      <div className="max-w-2xl mx-auto px-6 py-10">
+        {step.type === "program" && (
+          <Screen icon={null} title="What are you training to become?">
+            <ChoiceRow
+              options={Object.keys(PROGRAM_DEFAULTS).map((p) => ({
+                value: p,
+                label: p,
+                disabled: p === "Physician Assistant (PA)" || p === "Pharmacy (PharmD)",
+                note: (p === "Physician Assistant (PA)" || p === "Pharmacy (PharmD)") ? "In progress" : undefined,
+              }))}
+              value={answers.programType}
+              onChange={(v) => {
+                const d = PROGRAM_DEFAULTS[v];
+                set({ programType: v, yearsInSchool: d.years, trainingYears: d.training });
+              }}
+            />
+            <p className="text-xs text-slate font-plex mt-4">
+              Only MD/DO students are required to complete a residency — PA and pharmacy programs don't require
+              a post-grad residency, though optional ones exist.
+            </p>
+            <p className="text-xs text-teal font-plex mt-2">
+              PA and Pharmacy support is on the way — this version is tuned for the MD/DO path.
+            </p>
+            <NavButtons onBack={goBack} onNext={goNext} backDisabled />
+          </Screen>
+        )}
+
+        {step.type === "yearsInSchool" && (
+          <Screen icon={null} title="How many years is your program?">
+            <Field label="Years in school">
+              <NumberInput value={answers.yearsInSchool} onChange={(v) => set({ yearsInSchool: Math.max(1, Math.min(6, Math.round(v))) })} step={1} suffix="years" />
+            </Field>
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "trainingYears" && (
+          <Screen icon={null} title="Years of post-grad training?">
+            <Field label="Residency / fellowship years (0 if none)" hint="Optional PGY residency (pharmacy) or postgrad fellowship (PA) counts too — otherwise leave at 0.">
+              <NumberInput value={answers.trainingYears} onChange={(v) => set({ trainingYears: Math.max(0, Math.min(7, Math.round(v))) })} step={1} suffix="years" />
+            </Field>
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "pslf" && (
+          <Screen icon={null} title="Are you pursuing Public Service Loan Forgiveness?">
+            <ChoiceRow
+              options={[{ value: true, label: "Yes, pursuing PSLF" }, { value: false, label: "No" }]}
+              value={answers.pslf}
+              onChange={(v) => set({ pslf: v })}
+            />
+            <p className="text-xs text-slate font-plex mt-4">
+              Don't worry — whichever you pick, I'll still show you what PSLF would look like on your results page.
+            </p>
+            <p className="text-xs text-slate font-plex mt-2">
+              PSLF forgives your remaining federal balance after 120 qualifying monthly payments (10 years)
+              while employed by a qualifying nonprofit or government employer.
+            </p>
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "refiRate" && (
+          <Screen icon={null} title="What refinance rate would you expect?">
+            <Field label="Refinance rate" hint="Most borrowers who skip PSLF refinance federal loans into a private loan once attending income begins — trading federal protections for a lower rate.">
+              <NumberInput value={answers.refiRate * 100} onChange={(v) => set({ refiRate: v / 100 })} step={0.1} suffix="%" placeholder="5.5" />
+            </Field>
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "borrowIntro" && (
+          <Screen icon={null} title="What are you borrowing?">
+            <div className="mb-5">
+              <ChoiceRow
+                options={[{ value: "simple", label: "Quick total" }, { value: "detailed", label: "Year by year (more accurate)" }]}
+                value={answers.borrowMode}
+                onChange={(v) => set({ borrowMode: v })}
+              />
+            </div>
+            <p className="text-xs text-slate font-plex mb-4">
+              Enter the amount you're actually borrowing (principal) — not your expected balance at graduation.
+              Interest between now and graduation is calculated separately, on the results page.
+            </p>
+            {answers.borrowMode === "simple" ? (
+              <>
+                <Field label="Total anticipated federal loans (principal only)">
+                  <NumberInput value={answers.simpleBorrow.fedTotal} onChange={(v) => set({ simpleBorrow: { ...answers.simpleBorrow, fedTotal: v } })} prefix="$" placeholder="e.g. 180,000" />
+                </Field>
+                <Field label="Average anticipated federal interest rate">
+                  <NumberInput value={answers.simpleBorrow.fedRate * 100} onChange={(v) => set({ simpleBorrow: { ...answers.simpleBorrow, fedRate: v / 100 } })} step={0.1} suffix="%" placeholder="6.25" />
+                </Field>
+                <Field label="Total anticipated private loans (principal only, 0 if none)">
+                  <NumberInput value={answers.simpleBorrow.privTotal} onChange={(v) => set({ simpleBorrow: { ...answers.simpleBorrow, privTotal: v } })} prefix="$" placeholder="e.g. 20,000" />
+                </Field>
+                <Field label="Average anticipated private interest rate">
+                  <NumberInput value={answers.simpleBorrow.privRate * 100} onChange={(v) => set({ simpleBorrow: { ...answers.simpleBorrow, privRate: v / 100 } })} step={0.1} suffix="%" placeholder="9.0" />
+                </Field>
+              </>
+            ) : (
+              <p className="text-sm text-slate font-plex">
+                Next you'll enter federal and private borrowing separately for each school year — more precise if your
+                amounts or rates change year to year.
+              </p>
+            )}
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "borrowYear" && (
+          <Screen icon={null} title={`School year ${step.index + 1} of ${answers.yearsInSchool} — what are you borrowing?`}>
+            <Field label="Federal loan amount (principal only)">
+              <NumberInput value={answers.detailedRows[step.index].fedAmt} onChange={(v) => setRow(step.index, { fedAmt: v })} prefix="$" placeholder="e.g. 45,000" />
+            </Field>
+            <Field label="Federal interest rate">
+              <NumberInput value={answers.detailedRows[step.index].fedRate * 100} onChange={(v) => setRow(step.index, { fedRate: v / 100 })} step={0.1} suffix="%" placeholder="6.25" />
+            </Field>
+            <Field label="Private loan amount (principal only, 0 if none)">
+              <NumberInput value={answers.detailedRows[step.index].privAmt} onChange={(v) => setRow(step.index, { privAmt: v })} prefix="$" placeholder="e.g. 5,000" />
+            </Field>
+            <Field label="Private interest rate">
+              <NumberInput value={answers.detailedRows[step.index].privRate * 100} onChange={(v) => setRow(step.index, { privRate: v / 100 })} step={0.1} suffix="%" placeholder="9.0" />
+            </Field>
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "lastYearIncome" && (
+          <Screen icon={null} title="Will your income be $0 in your last year of school?">
+            <p className="text-xs text-slate font-plex mb-3">
+              RAP payments are based on the <em>prior</em> year's income, so this sets your PGY1 payment. Most
+              students have no reportable income the year before training starts.
+            </p>
+            <ChoiceRow
+              options={[{ value: true, label: "Yes, $0" }, { value: false, label: "No, I had income" }]}
+              value={answers.lastYearSchoolIncomeZero}
+              onChange={(v) => set({ lastYearSchoolIncomeZero: v })}
+            />
+            {!answers.lastYearSchoolIncomeZero && (
+              <div className="mt-4">
+                <Field label="Approximate income that year">
+                  <NumberInput value={answers.lastYearSchoolIncome} onChange={(v) => set({ lastYearSchoolIncome: v })} prefix="$" placeholder="e.g. 15,000" />
+                </Field>
+              </div>
+            )}
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "pgySalary" && (
+          <Screen icon={null} title="Training-year salary">
+            <div className="mb-5">
+              <ChoiceRow
+                options={[{ value: "average", label: "Same average for all years" }, { value: "detailed", label: "Enter each year" }]}
+                value={answers.salaryMode}
+                onChange={(v) => set({ salaryMode: v })}
+              />
+            </div>
+            {answers.salaryMode === "average" ? (
+              <Field label={`Average annual salary across all ${answers.trainingYears} training years`}>
+                <NumberInput value={answers.avgPgySalary} onChange={(v) => set({ avgPgySalary: v })} prefix="$" placeholder="e.g. 68,000" />
+              </Field>
+            ) : (
+              Array.from({ length: answers.trainingYears }, (_, i) => (
+                <Field key={i} label={`PGY${i + 1} salary`}>
+                  <NumberInput value={answers.detailedPgySalaries[i]} onChange={(v) => setSalary(i, v)} prefix="$" placeholder="e.g. 64,000" />
+                </Field>
+              ))
+            )}
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "attendingSalary" && (
+          <Screen icon={null} title="Expected salary once training ends?">
+            <Field label="Starting gross annual attending / full salary">
+              <NumberInput value={answers.attendingSalary} onChange={(v) => set({ attendingSalary: v })} prefix="$" placeholder="e.g. 250,000" />
+            </Field>
+
+            <div className="mb-2">
+              <ChoiceRow
+                options={[{ value: false, label: "Flat (no raises)" }, { value: true, label: "Grows over time" }]}
+                value={answers.salaryGrowthEnabled}
+                onChange={(v) => set({ salaryGrowthEnabled: v })}
+              />
+            </div>
+            {answers.salaryGrowthEnabled && (
+              <div className="mb-2 pl-1">
+                <Field label="Annual raise">
+                  <NumberInput value={answers.salaryGrowthPct * 100} onChange={(v) => set({ salaryGrowthPct: v / 100 })} step={0.5} suffix="%" placeholder="3.0" />
+                </Field>
+                <Field label="Cap salary at">
+                  <NumberInput value={answers.salaryCap} onChange={(v) => set({ salaryCap: v })} prefix="$" placeholder="e.g. 500,000" />
+                </Field>
+              </div>
+            )}
+
+            <div className="border-t border-ink/10 my-6 pt-5">
+              <p className="font-plex text-sm font-medium text-ink mb-1">Employer loan repayment benefit</p>
+              <p className="text-xs text-slate font-plex mb-4">
+                Some employers pay down part of your loans as a hiring or retention benefit. Optional — leave at $0
+                if not applicable. Modeled as equal payments hitting your federal balance at the end of each
+                attending year, and applied against the fixed-term comparison on your results page.
+              </p>
+              <Field label="Total benefit amount">
+                <NumberInput value={answers.employerBenefitTotal} onChange={(v) => set({ employerBenefitTotal: v })} prefix="$" placeholder="e.g. 100,000" />
+              </Field>
+              {answers.employerBenefitTotal > 0 && (
+                <Field label="Paid out over how many years">
+                  <NumberInput value={answers.employerBenefitYears} onChange={(v) => set({ employerBenefitYears: Math.max(1, Math.round(v)) })} step={1} suffix="years" placeholder="3" />
+                </Field>
+              )}
+            </div>
+
+            <NavButtons onBack={goBack} onNext={goNext} />
+          </Screen>
+        )}
+
+        {step.type === "liveLikeResident" && (() => {
+          const lastResidencySalary =
+            answers.salaryMode === "average"
+              ? answers.avgPgySalary
+              : answers.detailedPgySalaries[answers.trainingYears - 1];
+          const previewFor = (mult) => Math.max(0, netAnnual(answers.attendingSalary) - netAnnual(mult * lastResidencySalary)) / 12;
+          return (
+            <Screen icon={null} title="Live (kinda) like a resident after training?">
+              <p className="text-xs text-slate font-plex mb-3">
+                Keep living on a resident-level budget (or 2x resident salary, cause, well... disposable income is
+                great) — and send the rest of your attending take-home pay to loans. Uses an estimated effective
+                tax rate for both incomes — a simplification, not a real tax calculation, but closer than comparing
+                raw gross figures.
+              </p>
+              <p className="text-xs text-slate font-plex mb-3">
+                Adding this feature will simply provide you with a comparison — showing you what this would look
+                like compared to paying a set amount based on a chosen loan term.
+              </p>
+              <div className="mb-5">
+                <ChoiceRow
+                  options={[
+                    { value: "off", label: "Skip this" },
+                    { value: "strict", label: `Live on ${money(lastResidencySalary)}/yr` },
+                    { value: "kinda", label: `Live on ${money(lastResidencySalary * 2)}/yr (2x)` },
+                  ]}
+                  value={answers.liveLikeResidentMode}
+                  onChange={(v) => set({ liveLikeResidentMode: v })}
+                />
+              </div>
+              {answers.liveLikeResidentMode !== "off" && (
+                <>
+                  <Field label="For how many years?">
+                    <ChoiceRow
+                      options={[1, 2, 3].map((y) => ({ value: y, label: `${y} ${y === 1 ? "year" : "years"}` }))}
+                      value={answers.liveLikeResidentYears}
+                      onChange={(v) => set({ liveLikeResidentYears: v })}
+                    />
+                  </Field>
+                  <p className="text-xs text-ink font-plex bg-teal-tint rounded-lg px-3 py-2">
+                    That means roughly{" "}
+                    <span className="font-mono font-medium">
+                      {money(previewFor(answers.liveLikeResidentMode === "strict" ? 1 : 2))}/mo
+                    </span>{" "}
+                    toward federal loans, based on your starting attending salary, after estimated taxes.
+                  </p>
+                </>
+              )}
+              <NavButtons onBack={goBack} onNext={goNext} />
+            </Screen>
+          );
+        })()}
+
+        {step.type === "privTrainPmt" && (
+          <Screen icon={null} title="Private loan payment during training?">
+            <p className="text-xs text-slate font-plex mb-3">
+              Private loans aren't RAP/PSLF-eligible, so there's no formula here — it's whatever you'd realistically
+              pay. Not sure? Many residents defer private loans entirely during training.
+            </p>
+            <div className="flex flex-wrap gap-2 mb-4">
+              {[0, 100, 200, 300].map((v) => (
+                <button
+                  key={v}
+                  onClick={() => set({ privTrainPmt: v })}
+                  className={`px-4 py-2 rounded-full border text-sm font-plex transition-colors ${
+                    answers.privTrainPmt === v ? "bg-teal text-paper border-teal" : "bg-white text-ink border-ink/20 hover:border-ink/50"
+                  }`}
+                >
+                  {v === 0 ? "$0 (deferred)" : `$${v}/mo`}
+                </button>
+              ))}
+            </div>
+            <Field label="Or enter an exact monthly amount">
+              <NumberInput value={answers.privTrainPmt} onChange={(v) => set({ privTrainPmt: v })} prefix="$" step={50} />
+            </Field>
+            <NavButtons onBack={goBack} onNext={goNext} nextLabel={answers.pslf ? "Next" : "See my chart"} />
+          </Screen>
+        )}
+
+        {step.type === "privRefi" && (
+          <Screen icon={null} title="Refinance your private loans at the end of residency?">
+            <p className="text-xs text-slate font-plex mb-3">
+              Since you're pursuing PSLF, your federal loans stay on RAP — but private loans aren't PSLF-eligible
+              anyway, and many residents refinance them once they land a higher attending salary and better credit.
+            </p>
+            <ChoiceRow
+              options={[{ value: "keep", label: "Keep original private rate" }, { value: "refinance", label: "Refinance as attending" }]}
+              value={answers.privRefiMode}
+              onChange={(v) => set({ privRefiMode: v })}
+            />
+            {answers.privRefiMode === "refinance" && (
+              <div className="mt-4">
+                <Field label="New private refinance rate">
+                  <NumberInput value={answers.privRefiRate * 100} onChange={(v) => set({ privRefiRate: v / 100 })} step={0.1} suffix="%" placeholder="6.5" />
+                </Field>
+              </div>
+            )}
+            <NavButtons onBack={goBack} onNext={goNext} nextLabel="See my chart" />
+          </Screen>
+        )}
+
+        {isResults && model && (
+          <Results answers={answers} model={model} onBack={goBack} onRestart={() => setStepIndex(0)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Screen({ icon, title, children }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-6">
+        {icon}
+        <h1 className="font-serif text-2xl text-ink leading-snug">{title}</h1>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Results({ answers, model, onBack, onRestart }) {
+  const {
+    fedGrad, privGrad, fedAvgRate, privAvgRate,
+    fedAttendBalance, privAttendBalance, refiFixedBalance, fedFixed, privFixed,
+    totalBorrowedFed, totalBorrowedPriv,
+    pslfTotalPaid, pslfForgiven,
+    residencyLife, attendingMonthlySalaries, llrScenarios, defaultLLRYears, lastResidencySalary, privTimeline, attendingRAPPayments, llrTargetsFederal, privRateForRepayment,
+  } = model;
+  const [attendingTerm, setAttendingTerm] = useState(10);
+  const [llrYearsView, setLlrYearsView] = useState(Math.min(3, Math.max(1, defaultLLRYears || 1)));
+  const [llrModeView, setLlrModeView] = useState(
+    llrScenarios && llrScenarios[answers.liveLikeResidentMode] ? answers.liveLikeResidentMode : (llrScenarios && Object.keys(llrScenarios)[0])
+  );
+  const selectedFedTerm = fedFixed.find((f) => f.term === attendingTerm) || fedFixed[1];
+  const selectedPrivTerm = privFixed.find((f) => f.term === attendingTerm) || privFixed[1];
+  // If pursuing PSLF, federal loans stay on RAP minimum payments through
+  // year 10 total (including residency) regardless of the term toggle — so
+  // the table needs to run at least that long, even if the private loan's
+  // own term (which the toggle actually controls) is shorter. If not
+  // pursuing PSLF, federal follows the selected fixed (refinanced) term like
+  // private does, so the toggle's length is all that's needed.
+  const yearsUntilForgiveness = Math.max(0, 10 - (answers.trainingYears || 0));
+  const rowCount = answers.pslf ? Math.max(attendingTerm, yearsUntilForgiveness) : attendingTerm;
+  const attendingLoanPayments = Array.from({ length: rowCount }, (_, i) =>
+    answers.pslf ? attendingRAPPayments[i] : (i * 12 < selectedFedTerm.payoffMonths ? selectedFedTerm.monthly : 0)
+  );
+  const hasPrivate = totalBorrowedPriv > 0;
+  const showSeparatePrivate = hasPrivate && answers.pslf;
+  const attendingLifeData = attendingMonthlySalaries.slice(0, rowCount).map((d, i) => {
+    const fedPayment = attendingLoanPayments[i];
+    const privPayment = showSeparatePrivate && i * 12 < selectedPrivTerm.payoffMonths ? selectedPrivTerm.monthly : 0;
+    return {
+      year: i + 1,
+      grossAnnual: d.grossAnnual,
+      monthlySalary: d.monthlyNet,
+      fedPayment,
+      privPayment,
+      leftover: d.monthlyNet - fedPayment - privPayment,
+    };
+  });
+  const avgLeftoverWhilePaying = (() => {
+    const paying = attendingLifeData.filter((d) => d.fedPayment > 0 || d.privPayment > 0);
+    if (paying.length === 0) return attendingLifeData[0]?.leftover ?? 0;
+    return paying.reduce((s, d) => s + d.leftover, 0) / paying.length;
+  })();
+  const llrView = llrScenarios && llrModeView ? llrScenarios[llrModeView]?.[llrYearsView] : null;
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-2">
+        <h1 className="font-serif text-2xl text-ink">Thanks for all that info. Now, let's get it paid off.</h1>
+      </div>
+      <p className="text-sm text-slate font-plex mb-6">
+        {answers.programType} · {answers.yearsInSchool} yrs school · {answers.trainingYears} yrs training ·{" "}
+        {answers.pslf ? "pursuing PSLF" : "not pursuing PSLF"}
+      </p>
+
+      <div className="mb-6">
+        <FlowRow
+          typeLabel={totalBorrowedPriv > 0 ? "Federal" : null}
+          fromLabel="Total Borrowed"
+          fromValue={money(totalBorrowedFed)}
+          toLabel="Balance at Graduation"
+          toValue={money(fedGrad)}
+        />
+        {totalBorrowedPriv > 0 && (
+          <FlowRow
+            typeLabel="Private"
+            fromLabel="Total Borrowed"
+            fromValue={money(totalBorrowedPriv)}
+            toLabel="Balance at Graduation"
+            toValue={money(privGrad)}
+          />
+        )}
+      </div>
+
+      {residencyLife.length > 0 && (() => {
+        const residencyLifeWithLeftover = residencyLife.map((d) => ({ ...d, leftover: d.monthlySalary - d.monthlyPayment - d.privatePayment }));
+        const avgResidencyLeftover = residencyLifeWithLeftover.reduce((s, d) => s + d.leftover, 0) / residencyLifeWithLeftover.length;
+        return (
+          <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+            <h2 className="font-plex text-sm font-medium text-ink mb-1">Here's your life during residency</h2>
+            <p className="text-xs text-slate font-plex mb-4">
+              RAP payments are based on the <em>prior</em> year's <em>gross</em> income — PGY1 is always the $10/month
+              minimum, since there's no reportable income the year before training starts.
+            </p>
+            <YearTable
+              data={residencyLifeWithLeftover}
+              yearLabel="PGY year"
+              columns={[
+                { key: "grossAnnual", label: "Annual salary (gross)", format: money },
+                { key: "monthlySalary", label: "After-tax monthly salary", format: money },
+                { key: "monthlyPayment", label: "Monthly RAP payment", format: money },
+                ...(totalBorrowedPriv > 0 ? [{ key: "privatePayment", label: "Monthly private payment", format: money }] : []),
+                { key: "leftover", label: "What's left", format: money },
+              ]}
+            />
+            <p className="text-xs text-ink font-plex mt-3 bg-teal-tint rounded-lg px-3 py-2">
+              So, during residency, you'll have <span className="font-mono font-medium">{money(avgResidencyLeftover)}</span> on
+              average to live off of every month. Keep in mind, investing (even a little) can go really far starting
+              now. Plus, retirement contributions during residency will decrease your AGI, which will ultimately
+              decrease your federal loan payments and taxable income.
+            </p>
+          </div>
+        );
+      })()}
+
+      {answers.trainingYears > 0 && privTimeline.length > 0 && totalBorrowedPriv > 0 && (
+        <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+          <h2 className="font-plex text-sm font-medium text-ink mb-1">Balance at the end of residency</h2>
+          <p className="text-xs text-slate font-plex mb-4">
+            Private loans aren't RAP-eligible, so they just accrue interest during training based on whatever
+            payment you set (or $0 if deferred) — no income-based relief the way federal loans get.
+          </p>
+          <YearTable
+            data={privTimeline}
+            yearLabel="PGY year"
+            columns={[
+              { key: "beginning", label: "Beginning balance", format: money },
+              { key: "interest", label: "Interest accrued", format: money, color: "text-coral" },
+              { key: "payment", label: "Payment made", format: money },
+              { key: "ending", label: "Ending balance", format: money },
+            ]}
+          />
+          <div className="mt-4">
+            <FlowRow
+              typeLabel="Federal"
+              fromLabel="Balance at Graduation"
+              fromValue={money(fedGrad)}
+              toLabel="Balance at End of Residency"
+              toValue={money(fedAttendBalance)}
+            />
+            {Math.abs(fedAttendBalance - fedGrad) < 50 ? (
+              <p className="text-xs text-ink/70 font-plex -mt-1 mb-3">
+                No balance growth — RAP waives all unpaid interest during residency, so you finish with the same
+                federal balance you started with.
+              </p>
+            ) : fedAttendBalance < fedGrad ? (
+              <p className="text-xs text-ink/70 font-plex -mt-1 mb-3">
+                Your federal balance actually shrank by <span className="font-mono">{money(fedGrad - fedAttendBalance)}</span> during
+                residency — your RAP payments covered more than just interest in later years.
+              </p>
+            ) : (
+              <p className="text-xs text-ink/70 font-plex -mt-1 mb-3">
+                Your federal balance grew by <span className="font-mono">{money(fedAttendBalance - fedGrad)}</span> during residency.
+              </p>
+            )}
+            <FlowRow
+              typeLabel="Private"
+              fromLabel="Balance at Graduation"
+              fromValue={money(privGrad)}
+              toLabel="Balance at End of Residency"
+              toValue={money(privAttendBalance)}
+            />
+          </div>
+          {!answers.pslf && (
+            <div className="mt-1">
+              <p className="text-xs text-ink font-plex mb-2">And now, we refinance...</p>
+              <FlowRow fromLabel="Federal Rate" fromValue={pct(fedAvgRate)} toLabel="Refinance Rate" toValue={pct(answers.refiRate)} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {answers.trainingYears > 0 && totalBorrowedPriv === 0 && (
+        <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+          <h2 className="font-plex text-sm font-medium text-ink mb-3">Balance at the end of residency</h2>
+          <FlowRow fromLabel="Balance at Graduation" fromValue={money(fedGrad)} toLabel="Balance at End of Residency" toValue={money(fedAttendBalance)} />
+          {Math.abs(fedAttendBalance - fedGrad) < 50 ? (
+            <p className="text-xs text-ink/70 font-plex mb-1">
+              No balance growth — RAP waives all unpaid interest during residency, so you finish with the same
+              balance you started with.
+            </p>
+          ) : fedAttendBalance < fedGrad ? (
+            <p className="text-xs text-ink/70 font-plex mb-1">
+              Your balance actually shrank by <span className="font-mono">{money(fedGrad - fedAttendBalance)}</span> during
+              residency — your RAP payments covered more than just interest in later years.
+            </p>
+          ) : (
+            <p className="text-xs text-ink/70 font-plex mb-1">
+              Your balance grew by <span className="font-mono">{money(fedAttendBalance - fedGrad)}</span> during residency.
+            </p>
+          )}
+          {!answers.pslf && (
+            <div className="mt-4">
+              <p className="text-xs text-ink font-plex mb-2">And now, we refinance...</p>
+              <FlowRow fromLabel="Federal Rate" fromValue={pct(fedAvgRate)} toLabel="Refinance Rate" toValue={pct(answers.refiRate)} />
+            </div>
+          )}
+        </div>
+      )}
+
+
+      {!answers.pslf && (
+        <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+          <h2 className="font-plex text-sm font-medium text-ink mb-2">
+            The big picture of these refinanced loans...
+          </h2>
+          <p className="text-sm text-ink font-plex">
+            {answers.employerBenefitTotal > 0 && (
+              <>
+                With <span className="font-mono font-medium">{money(answers.employerBenefitTotal)}</span> of employer
+                benefit over {answers.employerBenefitYears} years,{" "}
+              </>
+            )}
+            you will be debt free in{" "}
+            <span className="font-mono font-medium">{(fedFixed[0].payoffMonths / 12).toFixed(1)} years</span> with
+            monthly payments of <span className="font-mono font-medium">{money(fedFixed[0].monthly)}</span>. I know
+            this sounds like a big number, but you're an attending now with a big paycheck.
+          </p>
+          <div className="mt-4">
+            <TermTable rows={fedFixed} showPayoff={answers.employerBenefitTotal > 0} />
+          </div>
+        </div>
+      )}
+      <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+        <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+          <h2 className="font-plex text-sm font-medium text-ink">So, what does attending life look like...</h2>
+          {(!answers.pslf || hasPrivate) && (
+            <div className="flex gap-1.5">
+              {[5, 10, 15].map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setAttendingTerm(t)}
+                  className={`px-3 py-1 rounded-full border text-xs font-plex transition-colors ${
+                    attendingTerm === t ? "bg-teal text-paper border-teal" : "bg-white text-ink border-ink/20 hover:border-ink/50"
+                  }`}
+                >
+                  {t}-yr plan
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <p className="text-xs text-slate font-plex mb-4">
+          {answers.pslf ? (
+            <>
+              Federal loans stay on RAP minimum payments through year {10 - (answers.trainingYears || 0)} of attending
+              life (year 10 total, including residency) — regardless of the {attendingTerm}-year toggle above, which
+              only applies to
+              {hasPrivate ? " your private loan." : " private loans, and you have none."}{" "}
+              {rowCount > attendingTerm
+                ? `The table below runs ${rowCount} years so you can see federal payments continue through forgiveness, even though the private term is shorter.`
+                : "Federal payment goes to $0 once forgiven."}
+            </>
+          ) : (
+            <>
+              First {attendingTerm} years of attending life under the {attendingTerm}-year refinanced loan plan
+              {hasPrivate ? " (your federal and private balances are combined into one loan at refinance)" : ""} —
+              does not include any "live like a resident" scenario below. Payment goes to $0 once it's paid
+              off{answers.employerBenefitTotal > 0 ? " — sped up by your employer benefit" : ""}.
+            </>
+          )}
+        </p>
+        <YearTable
+          data={attendingLifeData}
+          yearLabel="Attending year"
+          columns={[
+            { key: "grossAnnual", label: "Annual salary (gross)", format: money },
+            { key: "monthlySalary", label: "After-tax monthly salary", format: money },
+            { key: "fedPayment", label: answers.pslf ? "Federal pmt (RAP)" : "Refinanced loan pmt", format: money },
+            ...(showSeparatePrivate ? [{ key: "privPayment", label: "Private pmt", format: money }] : []),
+            { key: "leftover", label: "What's left", format: money },
+          ]}
+        />
+        <p className="text-xs text-ink font-plex mt-3 bg-teal-tint rounded-lg px-3 py-2">
+          Even while paying the loan down, roughly <span className="font-mono font-medium">{money(avgLeftoverWhilePaying)}</span> on
+          average/month is left over for everything else.
+        </p>
+      </div>
+
+      {answers.pslf && totalBorrowedPriv > 0 && (
+        <div className="bg-white rounded-2xl border border-ink/10 p-5 mb-6">
+          <h2 className="font-plex text-sm font-medium text-ink mb-1">
+            Private loan repayment summary, starting at {money(privAttendBalance)}
+          </h2>
+          <p className="text-xs text-slate font-plex mb-3">
+            Rate used: {pct(privRateForRepayment)}
+            {answers.privRefiMode === "refinance" && ` (refinanced from your original ${pct(privAvgRate)} rate at the start of attending)`}
+          </p>
+          <TermTable rows={privFixed} />
+          <p className="text-xs text-ink font-plex mt-3 bg-teal-tint rounded-lg px-3 py-2">
+            The "Total interest" above is only interest accrued <em>during repayment</em>, on top of the{" "}
+            <span className="font-mono font-medium">{money(privAttendBalance)}</span> balance you're carrying into
+            attending life — not interest since your original{" "}
+            <span className="font-mono font-medium">{money(totalBorrowedPriv)}</span> borrowed.{" "}
+            <span className="font-mono font-medium">{money(privAttendBalance - totalBorrowedPriv)}</span> in interest
+            already accrued during school and training, before repayment even starts.
+          </p>
+        </div>
+      )}
+
+      {llrScenarios && llrView && (
+        <div className="bg-teal-tint rounded-2xl border border-teal-tint p-5 mb-6">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <h2 className="font-plex text-sm font-medium text-ink">Or... you could live like a resident</h2>
+            <div className="flex gap-1.5">
+              {[1, 2, 3].map((y) => (
+                <button
+                  key={y}
+                  onClick={() => setLlrYearsView(y)}
+                  className={`px-3 py-1 rounded-full border text-xs font-plex transition-colors ${
+                    llrYearsView === y ? "bg-teal text-paper border-teal" : "bg-white text-ink border-teal-tint hover:border-teal"
+                  }`}
+                >
+                  {y} {y === 1 ? "year" : "years"}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex gap-1.5 mb-3">
+            {Object.keys(llrScenarios).map((modeKey) => (
+              <button
+                key={modeKey}
+                onClick={() => setLlrModeView(modeKey)}
+                className={`px-3 py-1 rounded-full border text-xs font-plex transition-colors ${
+                  llrModeView === modeKey ? "bg-teal text-paper border-teal" : "bg-white text-ink border-teal-tint hover:border-teal"
+                }`}
+              >
+                Live on {money(modeKey === "strict" ? lastResidencySalary : lastResidencySalary * 2)}/yr
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-ink/60 font-plex mb-3">
+            Living on {money(llrView.livingOn)}/yr and sending the rest of your attending take-home pay to{" "}
+            {llrTargetsFederal
+              ? totalBorrowedPriv > 0
+                ? "your refinanced loan (federal + private combined)"
+                : "your refinanced loan"
+              : "private loans"}
+            {answers.employerBenefitTotal > 0 && llrTargetsFederal ? ", plus your employer benefit," : ""} for {llrYearsView}{" "}
+            {llrYearsView === 1 ? "year" : "years"}
+            {!llrTargetsFederal && " — your federal loans are being forgiven under PSLF regardless, so prepaying them wouldn't help"}:
+          </p>
+          <YearTable
+            data={llrView.rows}
+            yearLabel="Year"
+            columns={[
+              { key: "monthlyPayment", label: "Monthly payment", format: money },
+              { key: "endingBalance", label: "Balance at end of year", format: money },
+              { key: "interestPaid", label: "Total interest", format: money, color: "text-coral" },
+            ]}
+          />
+
+          {llrView.paidOff ? (
+            <p className="text-sm font-plex text-ink mt-3">
+              Fully paid off in <span className="font-mono font-medium">{(llrView.monthsToPayoff / 12).toFixed(1)} years</span> —
+              no need for a follow-up plan.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm font-plex text-ink mt-4 mb-2">
+                After {llrYearsView} {llrYearsView === 1 ? "year" : "years"}, <span className="font-mono font-medium">{money(llrView.endingBalance)}</span> remains.
+                Here's finishing it off under a fixed plan from that point:
+              </p>
+              <TermTable rows={llrView.continuationFixed} showPayoff />
+              <p className="text-xs text-ink/60 font-plex mt-3">
+                Combined across both phases: {llrYearsView} {llrYearsView === 1 ? "year" : "years"} living like a resident, then up to
+                the term above — e.g. the 10-year option means{" "}
+                <span className="font-mono font-medium">
+                  {(llrYearsView + (llrView.continuationFixed.find((f) => f.term === 10)?.payoffMonths ?? 0) / 12).toFixed(1)} years
+                </span>{" "}
+                total, paying{" "}
+                <span className="font-mono font-medium">
+                  {money(llrView.totalPaid + (llrView.continuationFixed.find((f) => f.term === 10)?.totalPaid ?? 0))}
+                </span>{" "}
+                altogether.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="bg-teal-tint rounded-2xl border border-teal-tint p-5 mb-6">
+        <div className="flex items-center gap-1.5 mb-3">
+          <h2 className="font-plex text-sm font-medium text-ink">Continuing on RAP through PSLF</h2>
+        </div>
+        <p className="text-xs text-ink/60 font-plex mb-3">
+          {answers.pslf
+            ? "Since you're pursuing PSLF, here's the realistic long-run RAP path:"
+            : "If you changed your mind and decided to pursue PSLF, here's what that could look like:"}{" "}
+          Shown regardless of your PSLF answer above, assuming continuous qualifying payments starting in PGY1.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <p className="text-xs text-ink/60 font-plex">Total paid over 10 years</p>
+            <p className="font-mono text-lg text-ink">{money(pslfTotalPaid)}</p>
+          </div>
+          <div>
+            <p className="text-xs text-ink/60 font-plex">Forgiven at year 10</p>
+            <p className="font-mono text-lg text-amber">{money(pslfForgiven)}</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between">
+        <button onClick={onBack} className="flex items-center gap-1.5 text-sm font-plex text-slate hover:text-ink transition-colors">
+          ← Back
+        </button>
+        <button onClick={onRestart} className="flex items-center gap-2 bg-teal text-paper px-5 py-2.5 rounded-full text-sm font-plex font-medium hover:bg-teal/90 transition-colors">
+          Start over
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value }) {
+  return (
+    <div className="bg-white rounded-xl border border-ink/10 p-4">
+      <p className="text-xs text-slate font-plex mb-1">{label}</p>
+      <p className="font-mono text-lg text-ink">{value}</p>
+    </div>
+  );
+}
+
+function FlowRow({ typeLabel, fromLabel, fromValue, toLabel, toValue }) {
+  return (
+    <div className="bg-white rounded-xl border border-ink/10 p-4 mb-3">
+      {typeLabel && <p className="text-xs text-slate font-plex mb-2">{typeLabel}</p>}
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex-1 min-w-[130px]">
+          <p className="text-xs text-slate font-plex mb-1">{fromLabel}</p>
+          <p className="font-mono text-lg text-ink">{fromValue}</p>
+        </div>
+        <span className="text-teal text-3xl font-bold font-plex leading-none">→</span>
+        <div className="flex-1 min-w-[130px]">
+          <p className="text-xs text-slate font-plex mb-1">{toLabel}</p>
+          <p className="font-mono text-lg text-ink">{toValue}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TermTable({ rows, showPayoff }) {
+  return (
+    <table className="w-full text-sm font-plex">
+      <thead>
+        <tr className="text-left text-slate text-xs">
+          <th className="font-normal pb-2">Term</th>
+          <th className="font-normal pb-2">Monthly</th>
+          {showPayoff && <th className="font-normal pb-2">Payoff</th>}
+          <th className="font-normal pb-2">Total paid</th>
+          <th className="font-normal pb-2">Total interest</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.term} className="border-t border-ink/5">
+            <td className="py-2 text-ink">{r.term}-year</td>
+            <td className="py-2 font-mono text-ink">{money(r.monthly)}/mo</td>
+            {showPayoff && (
+              <td className="py-2 font-mono text-teal">
+                {r.sped_up ? `${(r.payoffMonths / 12).toFixed(1)} yrs` : "—"}
+              </td>
+            )}
+            <td className="py-2 font-mono text-ink">{money(r.totalPaid)}</td>
+            <td className="py-2 font-mono text-coral">{money(r.totalInterest)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Rounds />);
+</script>
+</body>
+</html>
